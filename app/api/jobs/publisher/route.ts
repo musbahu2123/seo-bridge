@@ -1,17 +1,4 @@
 // app/api/jobs/publisher/route.ts — daily publisher with safety gates
-//
-// For each site with approved jobs:
-//   1. Live GET tenant (once per site) → list of {slug, url, title}
-//   2. For each job, in order:
-//      a. seoValidation.pass === false AND !forceOverride → refuse (422)
-//      b. landingFlag.flagged === true                  → refuse (422)
-//      c. matchSlug(job.slug, tenantPosts)             → refuse (409)
-//      d. POST payload to tenant                       → log postId, mark pushed
-//
-// Refusals do NOT change job status. Human resolves in review UI:
-//   - SEO fail  → regenerate or edit draft
-//   - Landing   → create the landing page manually, dismiss flag
-//   - Slug dup  → rename slug in the review UI, retry
 import { NextResponse } from "next/server";
 import dbConnect from "@/lib/dbConnect";
 import { decrypt } from "@/lib/crypto";
@@ -20,6 +7,7 @@ import Site from "@/models/Site";
 import Keyword from "@/models/Keyword";
 import PageIndex from "@/models/PageIndex";
 import { pingIndexNow } from "@/lib/indexnow";
+import { markJobFinished } from "@/lib/schedule";
 import { matchSlug, type ContentIndexEntry } from "@/lib/cannibalization";
 
 export const dynamic = "force-dynamic";
@@ -125,7 +113,6 @@ export async function GET(req: Request) {
     .sort({ createdAt: 1 })
     .limit(limit);
 
-  // Group jobs by site to do one tenant GET per site
   const bySite = new Map<string, typeof jobs>();
   for (const j of jobs) {
     const key = String(j.site);
@@ -158,7 +145,6 @@ export async function GET(req: Request) {
       continue;
     }
 
-    // Live tenant posts — one GET per site
     let tenantPosts: ContentIndexEntry[];
     try {
       tenantPosts = await fetchTenantPosts(
@@ -182,8 +168,7 @@ export async function GET(req: Request) {
 
     for (const job of siteJobs) {
       try {
-        // ── Gate 1: SEO formula ──
-        const seoPass = job.seoValidation?.pass !== false; // undefined/null = legacy = allow
+        const seoPass = job.seoValidation?.pass !== false;
         const seoOverride = job.seoValidation?.forceOverride === true;
         if (!seoPass && !seoOverride) {
           results.push({
@@ -197,7 +182,6 @@ export async function GET(req: Request) {
           continue;
         }
 
-        // ── Gate 2: Landing flag ──
         if (job.landingFlag?.flagged === true) {
           results.push({
             job: String(job._id),
@@ -209,7 +193,6 @@ export async function GET(req: Request) {
           continue;
         }
 
-        // ── Gate 3: Slug dup ──
         const dup = matchSlug(job.slug, tenantPosts);
         if (dup) {
           results.push({
@@ -223,7 +206,6 @@ export async function GET(req: Request) {
           continue;
         }
 
-        // ── All gates pass → POST ──
         const payload = {
           title: job.title,
           slug: job.slug,
@@ -304,6 +286,12 @@ export async function GET(req: Request) {
   const succeeded = results.filter(
     (r): r is Success => "publishedUrl" in r,
   ).length;
+
+  await markJobFinished(
+    "publisher",
+    true,
+    `${succeeded} pushed, ${refused} refused, ${results.length - succeeded - refused} failed`,
+  );
 
   return NextResponse.json({
     ok: true,

@@ -1,11 +1,11 @@
-// Weekly linkreview — aggregates the data the Monday ritual needs.
-// Human judgement stays human — this surfaces the numbers ranked by impact.
+// app/api/jobs/linkreview/route.ts — weekly link review aggregation
 import { NextResponse } from "next/server";
 import dbConnect from "@/lib/dbConnect";
 import Site from "@/models/Site";
 import LinkTask from "@/models/LinkTask";
 import Keyword from "@/models/Keyword";
 import WeeklySnapshot from "@/models/WeeklySnapshot";
+import { markJobFinished } from "@/lib/schedule";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
@@ -40,7 +40,6 @@ export async function GET(req: Request) {
   }> = [];
 
   for (const site of sites) {
-    // Referring domains: from Bing/GSC — we don't have those wired yet, so use placed-link count as a floor.
     const placed = await LinkTask.countDocuments({ site: site._id, status: "placed" });
     const placed7 = await LinkTask.countDocuments({
       site: site._id, status: "placed",
@@ -55,7 +54,6 @@ export async function GET(req: Request) {
       judgeAfter: { $gt: new Date() },
     });
 
-    // 5 actions ranked by business value (heuristic)
     const targetKeywords = await Keyword.find({ site: site._id, decision: "TARGET", status: { $in: ["new", "approved"] } })
       .sort({ opportunityScore: -1 })
       .limit(5)
@@ -69,7 +67,6 @@ export async function GET(req: Request) {
     if (placed7 === 0 && placed30 < 4) actions.push("No links placed in last 7 days — send 5 outreach emails this week");
     if (actions.length === 0) actions.push("No urgent link actions — continue scheduled rituals");
 
-    // Snapshot
     const week = mondayOf(new Date());
     await WeeklySnapshot.findOneAndUpdate(
       { site: site._id, week },
@@ -88,5 +85,6 @@ export async function GET(req: Request) {
     });
   }
 
+  await markJobFinished("linkreview", true, `${out.length} sites reviewed`);
   return NextResponse.json({ ok: true, sites: out });
 }

@@ -1,26 +1,10 @@
 // app/api/jobs/content-sync/route.ts — index every post on every tenant
-//
-// Pipeline per site:
-//   decrypt publishKey
-//     → GET site.publishUrl  (x-api-key header)
-//     → resolve array at site.contentResponsePath ("" = root)
-//     → for each post: upsert into ContentIndex by (site, url)
-//     → for NEW or UPDATED posts: batch of 10 → LLM → classification
-//     → upsert again with classification
-//
-// First run on a fresh site: indexes ALL posts, classifies all.
-// Subsequent runs: only re-classifies posts whose blogPostUpdatedAt changed.
-//
-// Auth: ?key=CRON_SECRET or x-cron-secret header.
-// Query params:
-//   ?site=<siteId>     → sync only that site
-//   ?limit=<n>         → cap posts processed per site (default 500, max 1000)
-//   ?classify=0        → skip the LLM step (fast slug-only resync)
 import { NextResponse } from "next/server";
 import dbConnect from "@/lib/dbConnect";
 import { decrypt } from "@/lib/crypto";
 import Site from "@/models/Site";
 import ContentIndex from "@/models/ContentIndex";
+import { markJobFinished } from "@/lib/schedule";
 import {
   extractBatch,
   type PostForClassification,
@@ -39,8 +23,6 @@ function authorized(req: Request): boolean {
   );
 }
 
-// ── Helpers ──
-
 type RawBlogPost = {
   _id?: string;
   title?: string;
@@ -55,8 +37,6 @@ type RawBlogPost = {
 };
 
 function resolveArray(json: unknown, path: string): RawBlogPost[] {
-  // path "" → json must be array
-  // path "data.posts" → json.data.posts must be array
   if (!path) {
     return Array.isArray(json) ? (json as RawBlogPost[]) : [];
   }
@@ -99,8 +79,6 @@ function absUrl(domain: string, slug: string): string {
   return `https://${host}/blog/${slug}`;
 }
 
-// ── Route ──
-
 export async function GET(req: Request) {
   if (!authorized(req)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -136,7 +114,6 @@ export async function GET(req: Request) {
     let classified = 0;
     let skippedUnchanged = 0;
 
-    // ── 1. Fetch posts from the tenant ──
     let apiKey: string;
     try {
       apiKey = decrypt(site.publishKey);
@@ -159,7 +136,6 @@ export async function GET(req: Request) {
       const json = (await res.json()) as unknown;
       rawPosts = resolveArray(json, site.contentResponsePath || "");
       if (rawPosts.length === 0) {
-        // Common misconfig: contentResponsePath wrong. Surface the shape.
         const keys =
           json && typeof json === "object" && !Array.isArray(json)
             ? Object.keys(json as Record<string, unknown>).slice(0, 8)
@@ -179,7 +155,6 @@ export async function GET(req: Request) {
     rawPosts = rawPosts.slice(0, limit);
     fetched = rawPosts.length;
 
-    // ── 2. Build the ContentIndex records (slug + url + metadata) ──
     const toClassify: Array<{
       slug: string;
       doc: {
@@ -196,7 +171,7 @@ export async function GET(req: Request) {
 
     for (const p of rawPosts) {
       const slug = String(p.slug ?? "").trim();
-      if (!slug) continue; // skip malformed
+      if (!slug) continue;
 
       const title = String(p.title ?? "").trim() || slug;
       const description = String(p.description ?? "").trim();
@@ -207,7 +182,6 @@ export async function GET(req: Request) {
       const publishedAt = p.publishedAt ? new Date(p.publishedAt) : null;
       const blogPostUpdatedAt = p.updatedAt ? new Date(p.updatedAt) : null;
 
-      // Check if unchanged
       const existing = await ContentIndex.findOne({
         site: site._id,
         url,
@@ -225,8 +199,6 @@ export async function GET(req: Request) {
         continue;
       }
 
-      // Upsert base record. Preserves classification fields if already set
-      // (only base fields are $set here).
       await ContentIndex.findOneAndUpdate(
         { site: site._id, url },
         {
@@ -250,7 +222,6 @@ export async function GET(req: Request) {
       );
       upserted++;
 
-      // Queue for classification only if we have body content to classify
       if (doClassify && content) {
         toClassify.push({
           slug,
@@ -259,9 +230,7 @@ export async function GET(req: Request) {
       }
     }
 
-    // ── 3. Batch-classify with the LLM (10 per call, sequential for safety) ──
     if (toClassify.length > 0) {
-      // Build a slug → content-excerpt map for the LLM payload
       const excerptBySlug = new Map<string, string>();
       for (const p of rawPosts) {
         const slug = String(p.slug ?? "").trim();
@@ -317,5 +286,10 @@ export async function GET(req: Request) {
     });
   }
 
+  await markJobFinished(
+    "content-sync",
+    true,
+    `${summary.reduce((a, s) => a + s.upserted, 0)} upserted, ${summary.reduce((a, s) => a + s.classified, 0)} classified`,
+  );
   return NextResponse.json({ ok: true, sites: summary });
 }

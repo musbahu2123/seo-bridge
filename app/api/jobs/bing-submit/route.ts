@@ -1,10 +1,9 @@
-// Daily Bing URL Submission.
-// First run per site: backfill all sitemap URLs (BWT allows 10k/day).
-// Subsequent runs: submit any own PageIndex URLs not yet submitted.
+// app/api/jobs/bing-submit/route.ts — daily Bing URL submission
 import { NextResponse } from "next/server";
 import dbConnect from "@/lib/dbConnect";
 import Site from "@/models/Site";
 import PageIndex from "@/models/PageIndex";
+import { markJobFinished } from "@/lib/schedule";
 import { bingSubmitUrls } from "@/lib/bing";
 
 export const dynamic = "force-dynamic";
@@ -46,13 +45,11 @@ export async function GET(req: Request) {
     try {
       const origin = `https://${site.domain.replace(/^https?:\/\//, "").replace(/\/$/, "")}`;
 
-      // First run: submit full sitemap
       const tracked = await PageIndex.countDocuments({ site: site._id, type: "own" });
       let urls: string[];
       if (tracked < 5) {
         urls = await fetchSitemapUrls(site.sitemapUrl, 10000);
       } else {
-        // Routine: any own URLs never submitted (no bing flag yet on PageIndex)
         const recent = await PageIndex.find({ site: site._id, type: "own" })
           .sort({ firstSeen: -1 })
           .limit(200)
@@ -67,5 +64,10 @@ export async function GET(req: Request) {
     }
   }
 
+  await markJobFinished(
+    "bing-submit",
+    true,
+    `${summary.reduce((a, s) => a + s.submitted, 0)} urls submitted`,
+  );
   return NextResponse.json({ ok: true, summary });
 }

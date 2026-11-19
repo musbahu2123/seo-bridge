@@ -1,10 +1,9 @@
-// Daily index monitor (GSC URL Inspection).
-// First run per site: bulk-inspect ALL sitemap URLs (Amendment A).
-// Subsequent runs: only the 20 newest own pages.
+// app/api/jobs/index-monitor/route.ts — daily index monitor
 import { NextResponse } from "next/server";
 import dbConnect from "@/lib/dbConnect";
 import Site from "@/models/Site";
 import PageIndex from "@/models/PageIndex";
+import { markJobFinished } from "@/lib/schedule";
 import { getAccessToken, inspectUrl, type InspectionResult } from "@/lib/gsc";
 
 export const dynamic = "force-dynamic";
@@ -29,7 +28,6 @@ async function fetchSitemapUrls(sitemapUrl: string, max = 500): Promise<string[]
     const re = /<loc>\s*([^<\s]+)\s*<\/loc>/gi;
     let m: RegExpExecArray | null;
     while ((m = re.exec(xml)) !== null && urls.length < max) urls.push(m[1]);
-    // sitemap-index → recurse one level
     const sitemapRefs = urls.filter((u) => u.endsWith(".xml"));
     if (sitemapRefs.length > 0) {
       const nested: string[] = [];
@@ -70,9 +68,8 @@ export async function GET(req: Request) {
       let targets: string[] = [];
 
       if (existingOwn === 0) {
-        // FIRST RUN: bulk-inspect entire sitemap
         const sitemapUrls = await fetchSitemapUrls(site.sitemapUrl, 500);
-        targets = sitemapUrls.slice(0, 1900); // stay under 2000/day quota
+        targets = sitemapUrls.slice(0, 1900);
         for (const u of sitemapUrls.slice(0, 1900)) {
           await PageIndex.updateOne(
             { site: site._id, url: u },
@@ -85,7 +82,6 @@ export async function GET(req: Request) {
           );
         }
       } else {
-        // Routine: newest own URLs
         const recent = await PageIndex.find({ site: site._id, type: "own" })
           .sort({ firstSeen: -1 })
           .limit(20)
@@ -119,5 +115,10 @@ export async function GET(req: Request) {
     summary.push({ site: String(site._id), inspected, errors: errors.slice(0, 5) });
   }
 
+  await markJobFinished(
+    "index-monitor",
+    true,
+    `${summary.reduce((a, s) => a + s.inspected, 0)} urls inspected`,
+  );
   return NextResponse.json({ ok: true, summary });
 }

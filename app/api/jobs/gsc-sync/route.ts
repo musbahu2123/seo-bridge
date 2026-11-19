@@ -1,11 +1,10 @@
 // app/api/jobs/gsc-sync/route.ts — weekly GSC sync
-// Writes: WeeklySnapshot, Keyword(gsc), cannibalization flags.
-// Auth: ?key=CRON_SECRET  (or x-cron-secret header)
 import { NextResponse } from "next/server";
 import dbConnect from "@/lib/dbConnect";
 import Site from "@/models/Site";
 import Keyword from "@/models/Keyword";
 import WeeklySnapshot from "@/models/WeeklySnapshot";
+import { markJobFinished } from "@/lib/schedule";
 import {
   getAccessToken,
   searchAnalyticsAll,
@@ -28,8 +27,8 @@ function authorized(req: Request): boolean {
 function mondayOf(d: Date): Date {
   const x = new Date(d);
   x.setUTCHours(0, 0, 0, 0);
-  const day = x.getUTCDay(); // 0=Sun
-  const diff = (day + 6) % 7; // days since Monday
+  const day = x.getUTCDay();
+  const diff = (day + 6) % 7;
   x.setUTCDate(x.getUTCDate() - diff);
   return x;
 }
@@ -61,7 +60,6 @@ export async function GET(req: Request) {
       const token = await getAccessToken(site.gscRefreshToken as string);
       const win = window28d();
 
-      // ── Query-level 28d + prev 28d ──
       const [cur, prev] = await Promise.all([
         searchAnalyticsAll(token, {
           siteUrl: site.gscSiteUrl!,
@@ -77,7 +75,6 @@ export async function GET(req: Request) {
         }),
       ]);
 
-      // ── Page-level 28d (for cannibalization) ──
       const pageRows = await searchAnalyticsAll(token, {
         siteUrl: site.gscSiteUrl!,
         startDate: win.startDate,
@@ -85,7 +82,6 @@ export async function GET(req: Request) {
         dimensions: ["query", "page"],
       });
 
-      // ── Snapshot aggregates ──
       let clicks = 0;
       let impressions = 0;
       let posWeighted = 0;
@@ -97,13 +93,11 @@ export async function GET(req: Request) {
       const avgPosition = impressions > 0 ? posWeighted / impressions : 0;
       const ctr = impressions > 0 ? clicks / impressions : 0;
 
-      // ── New / lost queries ──
       const curQueries = new Set(cur.map((r) => r.keys[0]));
       const prevQueries = new Set(prev.map((r) => r.keys[0]));
       const newQueries = [...curQueries].filter((q) => !prevQueries.has(q));
       const lostQueries = [...prevQueries].filter((q) => !curQueries.has(q));
 
-      // ── Cannibalization: one query → 2+ distinct pages ──
       const queryToPages = new Map<string, Set<string>>();
       for (const r of pageRows) {
         const [q, page] = r.keys;
@@ -133,7 +127,6 @@ export async function GET(req: Request) {
         { upsert: true, new: true },
       );
 
-      // ── Upsert new queries as Keyword(source: gsc) ──
       let newKw = 0;
       let ctrOpps = 0;
       for (const r of cur) {
@@ -150,7 +143,6 @@ export async function GET(req: Request) {
           keyword: q,
         }).lean();
         if (existing) {
-          // update GSC evidence only
           await Keyword.updateOne(
             { _id: existing._id },
             {
@@ -193,5 +185,10 @@ export async function GET(req: Request) {
     }
   }
 
+  await markJobFinished(
+    "gsc-sync",
+    true,
+    `${results.filter((r) => r.ok).length}/${results.length} sites ok`,
+  );
   return NextResponse.json({ ok: true, results });
 }

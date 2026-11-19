@@ -1,14 +1,4 @@
 // app/api/jobs/keyword-harvest/route.ts — weekly keyword harvesting
-//
-// Pipeline per seed (brief §3.5):
-//   1. Cannibalization gate (ContentIndex + matchKeyword) → PARK & skip Serper
-//   2. Google Autocomplete expansion (free)
-//   3. Serper SERP + PAA + related + serpFeatures (1 credit)
-//   4. Opportunity Score engine
-//   5. Upsert Keyword row
-//
-// Auth: ?key=CRON_SECRET or x-cron-secret header.
-// Query: ?site=<id>  ?dry=1  ?limit=<n> (default 20, max 50)
 import { NextResponse } from "next/server";
 import dbConnect from "@/lib/dbConnect";
 import Site from "@/models/Site";
@@ -16,6 +6,7 @@ import Keyword from "@/models/Keyword";
 import ContentIndex from "@/models/ContentIndex";
 import { autocompleteExpand } from "@/lib/autocomplete";
 import { serperSearch } from "@/lib/serper";
+import { markJobFinished } from "@/lib/schedule";
 import {
   scoreKeyword,
   heuristicFit,
@@ -93,8 +84,6 @@ async function collectSeeds(site: {
   return out;
 }
 
-// Status precedence: never downgrade a row that has progressed past "approved".
-// Only new/watch/approved get set to "watch" by the cannibalization gate.
 function demotedStatus(prev: string | undefined): string {
   if (
     prev === "published" ||
@@ -141,7 +130,6 @@ export async function GET(req: Request) {
   for (const site of sites) {
     const errors: string[] = [];
 
-    // ── Load ContentIndex once for this site ──
     const contentIndexDocs = await ContentIndex.find({ site: site._id }).lean();
     const contentIndex: ContentIndexEntry[] = contentIndexDocs.map((d) => ({
       url: d.url,
@@ -179,7 +167,6 @@ export async function GET(req: Request) {
     let park = 0;
 
     for (const seed of topSeeds) {
-      // ── Gate: cannibalization (before spending a Serper credit) ──
       const dup = matchKeyword(seed.keyword, contentIndex);
       if (dup) {
         if (!dry) {
@@ -217,7 +204,6 @@ export async function GET(req: Request) {
         continue;
       }
 
-      // ── Serper call ──
       let serp;
       try {
         serp = await serperSearch(seed.keyword);
@@ -280,7 +266,6 @@ export async function GET(req: Request) {
       else if (breakdown.decision === "WATCH") watch++;
       else park++;
 
-      // ── Save PAA questions as new candidates ──
       if (!dry) {
         for (const q of serp.paas.slice(0, 5)) {
           const k = q.trim();
@@ -314,5 +299,10 @@ export async function GET(req: Request) {
     });
   }
 
+  await markJobFinished(
+    "keyword-harvest",
+    true,
+    `${summary.reduce((a, s) => a + s.newKeywords, 0)} new, ${summary.reduce((a, s) => a + s.cannibalized, 0)} dup`,
+  );
   return NextResponse.json({ ok: true, dry, limit, sites: summary });
 }
