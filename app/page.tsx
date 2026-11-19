@@ -1,3 +1,5 @@
+//app/page.tsx
+
 import { redirect } from "next/navigation";
 
 // / -> the admin dashboard (the (admin) layout guards the session)

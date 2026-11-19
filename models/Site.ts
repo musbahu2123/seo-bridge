@@ -3,27 +3,44 @@ import mongoose from "mongoose";
 
 const siteSchema = new mongoose.Schema(
   {
-    name: { type: String, required: true }, // "ResumeTailorApp"
-    domain: { type: String, required: true, unique: true }, // "resumetailorapp.com"
+    name: { type: String, required: true },
+    domain: { type: String, required: true, unique: true },
 
     // ── Google Search Console ──
-    gscSiteUrl: { type: String, default: null }, // "sc-domain:resumetailorapp.com" or "https://www...."
-    gscRefreshToken: { type: String, default: null }, // AES-GCM encrypted via lib/crypto
+    gscSiteUrl: { type: String, default: null },
+    gscRefreshToken: { type: String, default: null }, // AES-GCM encrypted
     gscConnectedAt: { type: Date, default: null },
 
     // ── Sources ──
     sitemapUrl: { type: String, required: true },
-    competitors: { type: [String], default: [] }, // ["zety.com","tealhq.com",...]
+    competitors: { type: [String], default: [] },
 
-    // ── Strategy context (injected into every LLM prompt) ──
-    positioning: { type: String, default: "" }, // "The resume tool that gets you interviews"
-    buyerPrompts: { type: [String], default: [] }, // AI-citation prospecting prompts (brief 11.3)
+    // ── Strategy context ──
+    positioning: { type: String, default: "" },
+    buyerPrompts: { type: [String], default: [] },
 
-    // ── Publishing (into the SaaS's existing admin blog API) ──
-    publishUrl: { type: String, required: true }, // https://www.resumetailorapp.com/api/admin/blog
-    publishKey: { type: String, required: true }, // ApiKey the SaaS admin created — AES-GCM encrypted
+    // ── Branded promo code (the "branded code" weapon) ──
+    promoCode: { type: String, default: "" },   // e.g. "INTV25"
+    promoUrl: { type: String, default: "" },    // e.g. "https://www.resumetailorapp.com/?promo=INTV25"
 
-    // ── Bridge topic -> target BlogPost category mapping ──
+    // ── Brand tokens for branded vs non-branded split in gsc-sync ──
+    brandTokens: {
+      type: [String],
+      default: ["resumetailor", "resume tailor", "rta"],
+    },
+
+    // ── Publishing ──
+    publishUrl: { type: String, required: true },
+    publishKey: { type: String, required: true }, // AES-GCM encrypted
+
+    // ── Multi-tenant GET response shape ──
+    // Some tenants return a top-level JSON array (default: "").
+    // Some wrap it: { data: { posts: [...] } } → "data.posts".
+    // content-sync resolves this dot-path before mapping posts.
+    // THIS IS THE MULTI-TENANT RELIABILITY LEVER — no code change per tenant.
+    contentResponsePath: { type: String, default: "" },
+
+    // ── Category map ──
     categoryMap: {
       type: Map,
       of: String,
@@ -37,7 +54,7 @@ const siteSchema = new mongoose.Schema(
       },
     },
 
-    ctaPages: { type: [String], default: [] }, // ["/ats-resume-checker","/ai-resume-builder",...]
+    ctaPages: { type: [String], default: [] },
     active: { type: Boolean, default: true },
   },
   { timestamps: true },

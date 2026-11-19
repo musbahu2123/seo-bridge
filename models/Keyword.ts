@@ -43,6 +43,10 @@ const keywordSchema = new mongoose.Schema(
     paas: { type: [String], default: [] }, // People Also Ask -> FAQ blocks + future keywords
     related: { type: [String], default: [] },
 
+    // ── SERP features (R5, Batch 4) ──
+    serpFeatures: { type: [String], default: [] },       // ["featured_snippet:table", "knowledge_panel", ...]
+    featuredSnippetType: { type: String, default: null }, // "paragraph"|"list"|"table"|"video"|null
+
     // ── GSC evidence ──
     gscImpressions: { type: Number, default: 0 },
     gscPosition: { type: Number, default: 0 },
@@ -54,6 +58,21 @@ const keywordSchema = new mongoose.Schema(
     },
     cluster: { type: String, default: "" },
     ctaPage: { type: String, default: "" }, // assigned tool page for this article's CTA
+
+    // ── Cannibalization (R2, Batch 4) ──
+    // Set by keyword-harvest / brief-generator when an existing post matches.
+    // Uses matchKeyword() from lib/cannibalization.
+    cannibalizedBy: {
+      url: { type: String, default: "" },
+      slug: { type: String, default: "" },
+      title: { type: String, default: "" },
+      matchedKeyword: { type: String, default: "" },
+      confidence: {
+        type: String,
+        enum: ["exact", "near", ""],
+        default: "",
+      },
+    },
 
     lastScoredAt: { type: Date, default: null },
     notes: { type: String, default: "" },

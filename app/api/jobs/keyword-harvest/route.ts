@@ -1,22 +1,19 @@
 // app/api/jobs/keyword-harvest/route.ts — weekly keyword harvesting
 //
-// Pipeline (brief §3.5):
-//   seeds (GSC queries + competitor sitemap titles)
-//     → Google Autocomplete expansion (free)
-//     → Serper SERP + PAA + related (1 credit per seed)
-//     → Opportunity Score engine
-//     → upsert Keyword rows
+// Pipeline per seed (brief §3.5):
+//   1. Cannibalization gate (ContentIndex + matchKeyword) → PARK & skip Serper
+//   2. Google Autocomplete expansion (free)
+//   3. Serper SERP + PAA + related + serpFeatures (1 credit)
+//   4. Opportunity Score engine
+//   5. Upsert Keyword row
 //
 // Auth: ?key=CRON_SECRET or x-cron-secret header.
-// Query params:
-//   ?site=<siteId>      → harvest only that site
-//   ?dry=1              → don't write, just return what would be written
-//   ?limit=<n>          → max seeds to fetch SERPs for (default 20 — watch your Serper credits)
-
+// Query: ?site=<id>  ?dry=1  ?limit=<n> (default 20, max 50)
 import { NextResponse } from "next/server";
 import dbConnect from "@/lib/dbConnect";
 import Site from "@/models/Site";
 import Keyword from "@/models/Keyword";
+import ContentIndex from "@/models/ContentIndex";
 import { autocompleteExpand } from "@/lib/autocomplete";
 import { serperSearch } from "@/lib/serper";
 import {
@@ -24,6 +21,7 @@ import {
   heuristicFit,
   type SerpResult,
 } from "@/lib/score";
+import { matchKeyword, type ContentIndexEntry } from "@/lib/cannibalization";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
@@ -45,12 +43,10 @@ async function fetchSitemapTitles(url: string, max = 40): Promise<string[]> {
     const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
     if (!res.ok) return [];
     const xml = await res.text();
-    // Grab URLs from <loc>...</loc>
     const locs: string[] = [];
     const re = /<loc>\s*([^<\s]+)\s*<\/loc>/gi;
     let m: RegExpExecArray | null;
     while ((m = re.exec(xml)) !== null && locs.length < max) locs.push(m[1]);
-    // Turn slugs into keywords: "/blog/how-to-negotiate-salary" → "how to negotiate salary"
     return locs
       .map((u) => {
         try {
@@ -74,25 +70,18 @@ async function collectSeeds(site: {
 }): Promise<Seed[]> {
   const seeds: Seed[] = [];
 
-  // 1. Existing GSC queries (source: gsc)
-  const gscKws = await Keyword.find({
-    site: site._id,
-    source: "gsc",
-  })
+  const gscKws = await Keyword.find({ site: site._id, source: "gsc" })
     .sort({ gscImpressions: -1 })
     .limit(15)
     .lean();
   for (const k of gscKws) seeds.push({ keyword: k.keyword, source: "gsc" });
 
-  // 2. Competitor sitemap titles (source: competitor)
   for (const c of site.competitors.slice(0, 3)) {
     const url = `https://${c.replace(/^https?:\/\//, "")}/sitemap.xml`;
     const titles = await fetchSitemapTitles(url, 20);
-    for (const t of titles)
-      seeds.push({ keyword: t, source: "competitor" });
+    for (const t of titles) seeds.push({ keyword: t, source: "competitor" });
   }
 
-  // Dedupe by keyword, keep first source
   const seen = new Set<string>();
   const out: Seed[] = [];
   for (const s of seeds) {
@@ -102,6 +91,20 @@ async function collectSeeds(site: {
     out.push(s);
   }
   return out;
+}
+
+// Status precedence: never downgrade a row that has progressed past "approved".
+// Only new/watch/approved get set to "watch" by the cannibalization gate.
+function demotedStatus(prev: string | undefined): string {
+  if (
+    prev === "published" ||
+    prev === "briefed" ||
+    prev === "drafted" ||
+    prev === "rejected"
+  ) {
+    return prev;
+  }
+  return "watch";
 }
 
 export async function GET(req: Request) {
@@ -128,6 +131,7 @@ export async function GET(req: Request) {
     seeds: number;
     fetchedSerps: number;
     newKeywords: number;
+    cannibalized: number;
     target: number;
     watch: number;
     park: number;
@@ -137,15 +141,23 @@ export async function GET(req: Request) {
   for (const site of sites) {
     const errors: string[] = [];
 
-    // 1. Collect seeds
+    // ── Load ContentIndex once for this site ──
+    const contentIndexDocs = await ContentIndex.find({ site: site._id }).lean();
+    const contentIndex: ContentIndexEntry[] = contentIndexDocs.map((d) => ({
+      url: d.url,
+      slug: d.slug,
+      title: d.title,
+      primaryKeyword: d.primaryKeyword ?? "",
+      secondaryKeywords: d.secondaryKeywords ?? [],
+      pageType: d.pageType ?? "blog",
+    }));
+
     const seeds = await collectSeeds(site);
-    // Prioritize gsc seeds, then competitor
     seeds.sort((a, b) =>
       a.source === b.source ? 0 : a.source === "gsc" ? -1 : 1,
     );
     const topSeeds = seeds.slice(0, limit);
 
-    // 2. Autocomplete expansion for each seed (cheap, no key)
     const autocompleteHits = new Map<string, number>();
     for (const s of topSeeds.slice(0, 8)) {
       try {
@@ -159,14 +171,53 @@ export async function GET(req: Request) {
       }
     }
 
-    // 3. Serper per seed → SERP + PAA + related
     let fetched = 0;
     let created = 0;
+    let cannibalizedCount = 0;
     let target = 0;
     let watch = 0;
     let park = 0;
 
     for (const seed of topSeeds) {
+      // ── Gate: cannibalization (before spending a Serper credit) ──
+      const dup = matchKeyword(seed.keyword, contentIndex);
+      if (dup) {
+        if (!dry) {
+          const existing = await Keyword.findOne({
+            site: site._id,
+            keyword: seed.keyword,
+          }).lean();
+
+          const nextStatus = demotedStatus(existing?.status as string | undefined);
+
+          await Keyword.findOneAndUpdate(
+            { site: site._id, keyword: seed.keyword },
+            {
+              $set: {
+                decision: "PARK",
+                status: nextStatus,
+                overrideReason: `Duplicate of ${dup.url} (${dup.confidence} match on "${dup.matchedKeyword}")`,
+                cannibalizedBy: {
+                  url: dup.url,
+                  slug: dup.slug,
+                  title: dup.title,
+                  matchedKeyword: dup.matchedKeyword,
+                  confidence: dup.confidence,
+                },
+                lastScoredAt: new Date(),
+              },
+              $setOnInsert: {
+                source: seed.source === "gsc" ? "gsc" : "serper",
+              },
+            },
+            { upsert: true },
+          );
+        }
+        cannibalizedCount++;
+        continue;
+      }
+
+      // ── Serper call ──
       let serp;
       try {
         serp = await serperSearch(seed.keyword);
@@ -176,7 +227,6 @@ export async function GET(req: Request) {
         continue;
       }
 
-      // ── Score the seed keyword itself ──
       const results: SerpResult[] = serp.organic.slice(0, 10).map((o) => ({
         title: o.title,
         domain: o.domain,
@@ -215,11 +265,11 @@ export async function GET(req: Request) {
               topResults: results.slice(0, 10),
               paas: serp.paas,
               related: serp.related,
+              serpFeatures: serp.serpFeatures,
+              featuredSnippetType: serp.featuredSnippetType,
               lastScoredAt: new Date(),
             },
-            $setOnInsert: {
-              status: "new",
-            },
+            $setOnInsert: { status: "new" },
           },
           { upsert: true, new: true },
         );
@@ -230,10 +280,9 @@ export async function GET(req: Request) {
       else if (breakdown.decision === "WATCH") watch++;
       else park++;
 
-      // ── Save PAA + related as new Keyword candidates (source: "paa") ──
+      // ── Save PAA questions as new candidates ──
       if (!dry) {
-        const paas = serp.paas.slice(0, 5);
-        for (const q of paas) {
+        for (const q of serp.paas.slice(0, 5)) {
           const k = q.trim();
           if (k.length < 8) continue;
           const exists = await Keyword.findOne({
@@ -257,6 +306,7 @@ export async function GET(req: Request) {
       seeds: topSeeds.length,
       fetchedSerps: fetched,
       newKeywords: created,
+      cannibalized: cannibalizedCount,
       target,
       watch,
       park,
@@ -264,10 +314,5 @@ export async function GET(req: Request) {
     });
   }
 
-  return NextResponse.json({
-    ok: true,
-    dry,
-    limit,
-    sites: summary,
-  });
+  return NextResponse.json({ ok: true, dry, limit, sites: summary });
 }
